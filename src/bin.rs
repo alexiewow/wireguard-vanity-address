@@ -1,169 +1,306 @@
+
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
 
 use clap::{App, AppSettings, Arg};
-use num_cpus;
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
+
 use wireguard_vanity_lib::trial;
 
-fn estimate_one_trial() -> Duration {
-    let prefix = "prefix";
-    let start = SystemTime::now();
-    const COUNT: u32 = 100;
-    (0..COUNT).for_each(|_| {
-        trial(&prefix, 0, 10);
-    });
-    let elapsed = start.elapsed().unwrap();
-    elapsed.checked_div(COUNT).unwrap()
-}
-
-fn duration_to_f64(d: Duration) -> f64 {
-    (d.as_secs() as f64) + (f64::from(d.subsec_nanos()) * 1e-9)
-}
-
-fn format_time(t: f64) -> String {
-    if t > 3600.0 {
-        format!("{:.2} hours", t / 3600.0)
-    } else if t > 60.0 {
-        format!("{:.1} minutes", t / 60.0)
-    } else if t > 1.0 {
-        format!("{:.1} seconds", t)
-    } else if t > 1e-3 {
-        format!("{:.1} ms", t * 1e3)
-    } else if t > 1e-6 {
-        format!("{:.1} us", t * 1e6)
-    } else if t > 1e-9 {
-        format!("{:.1} ns", t * 1e9)
-    } else {
-        format!("{:.3} ps", t * 1e12)
-    }
-}
-
-fn format_rate(rate: f64) -> String {
-    if rate > 1e9 {
-        format!("{:.2}e9 keys/s", rate / 1e9)
-    } else if rate > 1e6 {
-        format!("{:.2}e6 keys/s", rate / 1e6)
-    } else if rate > 1e3 {
-        format!("{:.2}e3 keys/s", rate / 1e3)
-    } else if rate > 1e0 {
-        format!("{:.2} keys/s", rate)
-    } else if rate > 1e-3 {
-        format!("{:.2}e-3 keys/s", rate * 1e3)
-    } else if rate > 1e-6 {
-        format!("{:.2}e-6 keys/s", rate * 1e6)
-    } else if rate > 1e-9 {
-        format!("{:.2}e-9 keys/s", rate * 1e9)
-    } else {
-        format!("{:.3}e-12 keys/s", rate * 1e12)
-    }
-}
-
-fn print(res: (String, String)) -> Result<(), io::Error> {
-    let (private_b64, public_b64) = res;
-    writeln!(
-        io::stdout(),
-        "private {}  public {}",
-        &private_b64,
-        &public_b64
-    )
-}
+const BENCHMARK_SECONDS: u64 = 10;
+const BATCH_SIZE: u64 = 10_000;
 
 #[derive(Debug)]
 struct ParseError(String);
+
 impl Error for ParseError {}
+
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
+fn format_time(seconds: f64) -> String {
+    if seconds >= 86400.0 {
+        format!("{:.2} days", seconds / 86400.0)
+    } else if seconds >= 3600.0 {
+        format!("{:.2} hours", seconds / 3600.0)
+    } else if seconds >= 60.0 {
+        format!("{:.1} minutes", seconds / 60.0)
+    } else if seconds >= 1.0 {
+        format!("{:.1} seconds", seconds)
+    } else if seconds >= 1e-3 {
+        format!("{:.1} ms", seconds * 1e3)
+    } else if seconds >= 1e-6 {
+        format!("{:.1} us", seconds * 1e6)
+    } else {
+        format!("{:.1} ns", seconds * 1e9)
+    }
+}
+
+fn benchmark(
+    targets: &[String],
+    end: Option<usize>,
+    case_sensitive: bool,
+) -> (u64, Duration) {
+    let start = Instant::now();
+    let mut attempts = 0u64;
+
+    while start.elapsed() < Duration::from_secs(BENCHMARK_SECONDS) {
+        (0..BATCH_SIZE)
+            .into_par_iter()
+            .for_each(|_| {
+                let _ = trial(targets, end, case_sensitive);
+            });
+
+        attempts += BATCH_SIZE;
+    }
+
+    (attempts, start.elapsed())
+}
+
+fn print_match(
+    result: (String, String, Vec<usize>),
+    targets: &[String],
+) -> Result<(), io::Error> {
+    let (private_b64, public_b64, matched) = result;
+
+    let names: Vec<&str> = matched
+        .iter()
+        .map(|&index| targets[index].as_str())
+        .collect();
+
+    writeln!(
+        io::stdout(),
+        "match {}  private {}  public {}",
+        names.join(","),
+        private_b64,
+        public_b64
+    )
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let matches = App::new("wireguard-vanity-address")
         .setting(AppSettings::ArgRequiredElseHelp)
-        .version("0.3.1")
+        .version(env!("CARGO_PKG_VERSION"))
         .author("Brian Warner <warner@lothar.com>")
-        .about("finds Wireguard keypairs with a given string prefix")
+        .about("Find WireGuard keypairs matching one or more public-key strings")
         .arg(
             Arg::with_name("RANGE")
                 .long("in")
                 .takes_value(true)
-                .help("NAME must be found within first RANGE chars of pubkey (default: 10)"),
+                .help("search within the first RANGE characters (default: prefix only)"),
         )
         .arg(
-            Arg::with_name("NAME")
+            Arg::with_name("THREADS")
+                .long("threads")
+                .takes_value(true)
+                .help("number of worker threads (default: all available cores)"),
+        )
+        .arg(
+            Arg::with_name("CASE_SENSITIVE")
+                .long("case-sensitive")
+                .help("match target strings with exact capitalisation"),
+        )
+        .arg(
+            Arg::with_name("TARGETS")
                 .required(true)
-                .help("string to find near the start of the pubkey"),
+                .multiple(true)
+                .help("one or more strings to find in public keys"),
         )
         .get_matches();
-    let prefix = matches.value_of("NAME").unwrap().to_ascii_lowercase();
-    let len = prefix.len();
-    let end: usize = 44.min(match matches.value_of("RANGE") {
-        Some(range) => range.parse()?,
-        None => {
-            if len <= 10 {
-                10
-            } else {
-                len + 10
-            }
+
+    let case_sensitive = matches.is_present("CASE_SENSITIVE");
+
+    let targets: Vec<String> = matches
+        .values_of("TARGETS")
+        .unwrap()
+        .map(str::to_string)
+        .collect();
+
+    for target in &targets {
+        if !target.is_ascii() {
+            return Err(ParseError(
+                format!("target '{}' must contain ASCII characters only", target)
+            ).into());
         }
-    });
-    if end < len {
-        return Err(ParseError(format!("range {} is too short for len={}", end, len)).into());
+
+        if target.is_empty() {
+            return Err(ParseError("targets must not be empty".into()).into());
+        }
+
+        if !target.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || b == b'+' || b == b'/'
+        }) {
+            return Err(ParseError(
+                format!("target '{}' contains invalid Base64 characters", target)
+            ).into());
+        }
     }
 
-    let offsets: u64 = 44.min((1 + end - len) as u64);
-    // todo: this is an approximation, offsets=2 != double the chances
-    let mut num = offsets;
-    let mut denom = 1u64;
-    prefix.chars().for_each(|c| {
-        if c.is_ascii_alphabetic() {
-            num *= 2; // letters can match both uppercase and lowercase
+    let end: Option<usize> = match matches.value_of("RANGE") {
+        Some(value) => {
+            let range: usize = value.parse()?;
+
+            if range == 0 || range > 43 {
+                return Err(ParseError(
+                    "search range must be between 1 and 43".into()
+                ).into());
+            }
+
+            for target in &targets {
+                if target.len() > range {
+                    return Err(ParseError(
+                        format!(
+                            "target '{}' is longer than search range {}",
+                            target, range
+                        )
+                    ).into());
+                }
+            }
+
+            Some(range)
         }
-        denom *= 64; // base64
-    });
-    let trials_per_key = denom / num;
+        None => None,
+    };
+
+    let threads: usize = match matches.value_of("THREADS") {
+        Some(value) => value.parse()?,
+        None => num_cpus::get(),
+    };
+
+    if threads == 0 {
+        return Err(ParseError(
+            "thread count must be at least 1".into()
+        ).into());
+    }
+
+    ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()?;
+
+    let search_targets: Vec<String> = if case_sensitive {
+        targets.clone()
+    } else {
+        targets.iter()
+            .map(|target| target.to_ascii_lowercase())
+            .collect()
+    };
 
     println!(
-        "searching for '{}' in pubkey[0..{}], one of every {} keys should match",
-        &prefix, end, trials_per_key
+        "searching for {} target(s), {}",
+        targets.len(),
+        if case_sensitive {
+            "case-sensitive"
+        } else {
+            "case-insensitive"
+        }
     );
 
-    // todo: dividing by num_cpus will overestimate performance when the
-    // cores aren't actually distinct (hyperthreading?). My Core-i7 seems to
-    // run at half the speed that this predicts.
+    for target in &targets {
+        let offsets = match end {
+            Some(range) => range - target.len() + 1,
+            None => 1,
+        };
 
-    if trials_per_key < 2u64.pow(32) {
-        let est = estimate_one_trial();
+        let mut combinations = 1.0f64;
+
+        for c in target.chars() {
+            let choices = if !case_sensitive && c.is_ascii_alphabetic() {
+                2.0
+            } else {
+                1.0
+            };
+
+            combinations *= 64.0 / choices;
+        }
+
+        let trials_per_key = combinations / offsets as f64;
+
         println!(
-            "one trial takes {}, CPU cores available: {}",
-            format_time(duration_to_f64(est)),
-            num_cpus::get()
-        );
-        let spk = duration_to_f64(
-            est // sec/trial on one core
-                .checked_div(num_cpus::get() as u32) // sec/trial with all cores
-                .unwrap()
-                .checked_mul(trials_per_key as u32) // sec/key (Duration)
-                .unwrap(),
-        );
-        let kps = 1.0 / spk;
-        println!(
-            "est yield: {} per key, {}",
-            format_time(spk),
-            format_rate(kps)
+            "  {:<12}  1 in {:.0}  ({} position{})",
+            target,
+            trials_per_key,
+            offsets,
+            if offsets == 1 { "" } else { "s" }
         );
     }
+
+    println!(
+        "benchmarking ({} seconds, {} worker threads)...",
+        BENCHMARK_SECONDS, threads
+    );
+    io::stdout().flush()?;
+
+    let (attempts, elapsed) =
+        benchmark(&search_targets, end, case_sensitive);
+
+    let trials_per_second =
+        attempts as f64 / elapsed.as_secs_f64();
+
+    println!(
+        "benchmark: {} trials in {}",
+        attempts,
+        format_time(elapsed.as_secs_f64())
+    );
+
+    println!(
+        "performance: {:.0} trials/s",
+        trials_per_second
+    );
+
+
+    println!();
+
+    println!(
+        "{:<12}  {:<20}  {}",
+        "Target", "Probability", "Expected time"
+    );
+
+    for target in &targets {
+        let offsets = match end {
+            Some(range) => range - target.len() + 1,
+            None => 1,
+        };
+
+        let mut combinations = 1.0f64;
+
+        for c in target.chars() {
+            let choices = if !case_sensitive && c.is_ascii_alphabetic() {
+                2.0
+            } else {
+                1.0
+            };
+
+            combinations *= 64.0 / choices;
+        }
+
+        let trials_per_key = combinations / offsets as f64;
+        let seconds_per_key = trials_per_key / trials_per_second;
+
+        println!(
+            "{:<12}  1 in {:<15.0}  {}",
+            target,
+            trials_per_key,
+            format_time(seconds_per_key)
+        );
+    }
+
+    println!();
+
 
     println!("hit Ctrl-C to stop");
 
-    // 1M trials takes about 10s on my laptop, so let it run for 1000s
-    (0..100_000_000)
-        .into_par_iter()
-        .map(|_| trial(&prefix, 0, end))
-        .filter_map(|r| r)
-        .try_for_each(print)?;
-    Ok(())
+    loop {
+        (0..1_000_000u64)
+            .into_par_iter()
+            .map(|_| trial(&search_targets, end, case_sensitive))
+            .filter_map(|result| result)
+            .try_for_each(|result| print_match(result, &targets))?;
+    }
 }
+
